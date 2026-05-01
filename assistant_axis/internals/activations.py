@@ -248,6 +248,42 @@ class ActivationExtractor:
 
             return result
 
+    def _normalize_input_ids(self, ids):
+        """
+        Normalize tokenizer outputs to a plain list[int].
+
+        Some tokenizer/chat-template paths return a plain list of token ids.
+        Others return a Hugging Face BatchEncoding or dict-like object with
+        an "input_ids" field. The padding code below expects list[int].
+        """
+        # Hugging Face BatchEncoding or dict-like output.
+        if isinstance(ids, dict) or hasattr(ids, "data"):
+            ids = ids["input_ids"]
+
+        # Tensor-like output.
+        if hasattr(ids, "detach"):
+            ids = ids.detach().cpu()
+
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+
+        # Tuple output.
+        if isinstance(ids, tuple):
+            ids = list(ids)
+
+        # Unwrap a single-example batch: [[...]] -> [...]
+        while isinstance(ids, list) and len(ids) == 1 and isinstance(ids[0], (list, tuple)):
+            ids = list(ids[0])
+
+        # Convert tensor scalar / numpy scalar values to plain Python ints.
+        normalized = []
+        for token_id in ids:
+            if hasattr(token_id, "item"):
+                token_id = token_id.item()
+            normalized.append(int(token_id))
+
+        return normalized
+
     def batch_conversations(
         self,
         conversations: List[List[Dict[str, str]]],
@@ -274,6 +310,10 @@ class ActivationExtractor:
             conversations, **chat_kwargs
         )
 
+        # Normalize tokenizer outputs before computing sequence lengths.
+        # Some tokenizer/chat-template paths return BatchEncoding objects rather than list[int].
+        batch_full_ids = [self._normalize_input_ids(ids) for ids in batch_full_ids]
+
         # Handle layer specification
         if isinstance(layer, int):
             layer_list = [layer]
@@ -281,6 +321,10 @@ class ActivationExtractor:
             layer_list = layer
         else:
             layer_list = list(range(len(self.probing_model.get_layers())))
+
+        # Normalize tokenizer outputs before computing sequence lengths.
+        # Some tokenizer paths return BatchEncoding objects rather than list[int].
+        batch_full_ids = [self._normalize_input_ids(ids) for ids in batch_full_ids]
 
         # Prepare batch tensors
         batch_size = len(batch_full_ids)
@@ -298,6 +342,9 @@ class ActivationExtractor:
 
         input_ids_batch = []
         attention_mask_batch = []
+
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
         for ids in batch_full_ids:
             # Truncate if too long

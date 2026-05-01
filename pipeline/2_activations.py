@@ -50,6 +50,73 @@ def load_responses(responses_file: Path) -> List[dict]:
             responses.append(entry)
     return responses
 
+def normalize_token_ids(tokenized):
+    """
+    Normalize tokenizer outputs to a plain list[int].
+
+    Some tokenizer/chat-template calls return list[int], while some newer
+    Hugging Face paths return BatchEncoding/dict-like objects or tensors.
+    """
+    if isinstance(tokenized, dict) or hasattr(tokenized, "data"):
+        tokenized = tokenized["input_ids"]
+
+    if hasattr(tokenized, "detach"):
+        tokenized = tokenized.detach().cpu()
+
+    if hasattr(tokenized, "tolist"):
+        tokenized = tokenized.tolist()
+
+    if isinstance(tokenized, tuple):
+        tokenized = list(tokenized)
+
+    # Unwrap single-example batch: [[...]] -> [...]
+    while isinstance(tokenized, list) and len(tokenized) == 1 and isinstance(tokenized[0], (list, tuple)):
+        tokenized = list(tokenized[0])
+
+    return [int(x.item() if hasattr(x, "item") else x) for x in tokenized]
+
+
+def get_assistant_token_span(tokenizer, conversation, chat_kwargs):
+    """
+    Return the token span corresponding to the final assistant response.
+
+    This avoids relying on Assistant-Axis SpanMapper when its role-span
+    detection fails for a tokenizer/chat-template combination.
+
+    We compute:
+    - start = token length of the conversation up to the assistant generation prompt
+    - end = token length of the full conversation including the assistant answer
+    """
+    if not conversation or conversation[-1].get("role") != "assistant":
+        return None
+
+    # Prefix includes system/user messages plus the assistant generation marker.
+    prefix_messages = conversation[:-1]
+
+    prefix_ids = tokenizer.apply_chat_template(
+        prefix_messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        **chat_kwargs,
+    )
+
+    full_ids = tokenizer.apply_chat_template(
+        conversation,
+        tokenize=True,
+        add_generation_prompt=False,
+        **chat_kwargs,
+    )
+
+    prefix_ids = normalize_token_ids(prefix_ids)
+    full_ids = normalize_token_ids(full_ids)
+
+    start = len(prefix_ids)
+    end = len(full_ids)
+
+    if end <= start:
+        return None
+
+    return start, end
 
 def extract_activations_batch(
     pm: ProbingModel,
@@ -62,7 +129,7 @@ def extract_activations_batch(
     """Extract mean response activations for a batch of conversations."""
     encoder = ConversationEncoder(pm.tokenizer, pm.model_name)
     extractor = ActivationExtractor(pm, encoder)
-    span_mapper = SpanMapper(pm.tokenizer)
+    # span_mapper = SpanMapper(pm.tokenizer)
 
     # Build chat_kwargs for Qwen models
     chat_kwargs = {}
@@ -88,40 +155,46 @@ def extract_activations_batch(
 
         # batch_activations shape: (num_layers, batch_size, max_seq_len, hidden_size)
 
-        # Build spans for this batch
-        _, batch_spans, span_metadata = encoder.build_batch_turn_spans(batch_conversations, **chat_kwargs)
+        # Directly compute the final assistant-response token span from the
+        # saved conversation. The original Assistant-Axis span builder returned
+        # zero spans for this Qwen/chat-template path, even though the forward
+        # pass successfully produced full-token activations.
+        seq_len = batch_activations.shape[2]
 
-        # Debug: print first 2 assistant spans
         if batch_start == 0:
-            for span in batch_spans[:4]:
-                if span['role'] == 'assistant':
-                    print(f"  DEBUG span: conv={span['conversation_id']} start={span['start']} end={span['end']} n_tokens={span['n_tokens']}")
+            print("DEBUG batch_activations shape:", tuple(batch_activations.shape))
 
-        # Use SpanMapper to get per-turn mean activations
-        # Returns list of tensors, each (num_turns, num_layers, hidden_size)
-        conv_activations_list = span_mapper.map_spans(batch_activations, batch_spans, batch_metadata)
+        for local_idx, conversation in enumerate(batch_conversations):
+            span = get_assistant_token_span(
+                pm.tokenizer,
+                conversation,
+                chat_kwargs,
+            )
 
-        # For each conversation, we want the assistant turn activations
-        # In single-turn conversations: turn 0 = user, turn 1 = assistant
-        for conv_acts in conv_activations_list:
-            if conv_acts.numel() == 0:
+            if span is None:
                 all_activations.append(None)
                 continue
 
-            # conv_acts shape: (num_turns, num_layers, hidden_size)
-            # For single-turn: (2, num_layers, hidden_size) - take turn 1 (assistant)
-            # For multi-turn: take odd indices (assistant turns)
-            if conv_acts.shape[0] >= 2:
-                # Take the last assistant turn (index 1 for single-turn)
-                assistant_act = conv_acts[1::2]  # All assistant turns
-                if assistant_act.shape[0] > 0:
-                    # Take mean across all assistant turns, transpose to (num_layers, hidden_size)
-                    mean_act = assistant_act.mean(dim=0).cpu()  # (num_layers, hidden_size)
-                    all_activations.append(mean_act)
-                else:
-                    all_activations.append(None)
-            else:
+            start, end = span
+
+            # Respect max_length/truncation from batch_conversations.
+            start = min(start, seq_len)
+            end = min(end, seq_len)
+
+            if end <= start:
                 all_activations.append(None)
+                continue
+
+            # batch_activations shape:
+            #   (num_layers, batch_size, seq_len, hidden_size)
+            #
+            # We average only over assistant answer tokens:
+            #   batch_activations[:, local_idx, start:end, :]
+            #
+            # Result shape:
+            #   (num_layers, hidden_size)
+            mean_act = batch_activations[:, local_idx, start:end, :].mean(dim=1).cpu()
+            all_activations.append(mean_act)
 
         # Cleanup
         del batch_activations
@@ -164,6 +237,21 @@ def process_role(pm: ProbingModel, role_file: Path, output_dir: Path, layers: Li
         enable_thinking=enable_thinking,
     )
 
+    # Log extraction quality before saving.
+    valid_count = sum(act is not None for act in activations_list)
+    none_count = sum(act is None for act in activations_list)
+    logger.info(
+        f"{role}: extracted {len(activations_list)} activation entries "
+        f"({valid_count} valid, {none_count} None)"
+    )
+
+    # Fail loudly if extraction produced no usable activations.
+    if valid_count == 0:
+        raise RuntimeError(
+            f"No usable activations extracted for role={role}. "
+            "This usually means assistant-token span mapping failed."
+        )
+
     # Build activation dict
     activations_dict = {}
     for i, (act, meta) in enumerate(zip(activations_list, metadata)):
@@ -175,6 +263,8 @@ def process_role(pm: ProbingModel, role_file: Path, output_dir: Path, layers: Li
     if activations_dict:
         torch.save(activations_dict, output_file)
         logger.info(f"Saved {len(activations_dict)} activations for {role}")
+    else:
+        raise RuntimeError(f"Activation dict is empty for role={role}; nothing was saved.")
 
     # Cleanup
     gc.collect()
