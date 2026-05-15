@@ -120,6 +120,12 @@ def role_question_guidance_entry(judge_guidance: dict, role_id: str, question_id
         if isinstance(role_block, dict) and question_id in role_block:
             return role_block[question_id]
 
+    # The v1 guidance schema stores entries under guidance -> role_id -> question_id.
+    if isinstance(judge_guidance.get("guidance"), dict):
+        role_block = judge_guidance["guidance"].get(role_id)
+        if isinstance(role_block, dict) and question_id in role_block:
+            return role_block[question_id]
+
     if isinstance(judge_guidance.get("guidance"), list):
         for entry in judge_guidance["guidance"]:
             if (
