@@ -24,9 +24,10 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import jsonlines
+import yaml
 from dotenv import load_dotenv
 from tqdm import tqdm
 
@@ -61,6 +62,166 @@ def load_responses(responses_file: Path) -> List[dict]:
     return responses
 
 
+def load_questions_by_index(questions_file: Optional[str]) -> Dict[int, dict]:
+    """Load optional question metadata keyed by zero-based question_index."""
+    if not questions_file:
+        return {}
+    path = Path(questions_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Questions file does not exist: {path}")
+
+    questions_by_index = {}
+    # Stage 3 score keys only retain q-index, so metadata is joined by JSONL order.
+    with jsonlines.open(path, 'r') as reader:
+        for question_index, question in enumerate(reader):
+            if not isinstance(question, dict):
+                raise ValueError(f"Question row {question_index} must be an object: {path}")
+            questions_by_index[question_index] = question
+    return questions_by_index
+
+
+def load_role_question_guidance(judge_guidance_file: Optional[str]) -> Optional[dict]:
+    """Load optional role-by-question judge guidance YAML."""
+    if not judge_guidance_file:
+        return None
+    path = Path(judge_guidance_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Judge guidance file does not exist: {path}")
+    with path.open('r') as f:
+        guidance = yaml.safe_load(f) or {}
+    if not isinstance(guidance, dict):
+        raise ValueError(f"Judge guidance file must contain a mapping: {path}")
+    return guidance
+
+
+def shared_trait_rule_from_guidance(judge_guidance: Optional[dict]) -> str:
+    """Return shared guidance text when configured."""
+    if not judge_guidance:
+        return ""
+    shared_trait_rule = judge_guidance.get("shared_trait_rule", "")
+    if shared_trait_rule is None:
+        return ""
+    if not isinstance(shared_trait_rule, str):
+        raise ValueError("judge guidance shared_trait_rule must be a string when provided.")
+    return shared_trait_rule
+
+
+def role_question_guidance_entry(judge_guidance: dict, role_id: str, question_id: str) -> Any:
+    """Find guidance for one role/question pair across supported YAML layouts."""
+    if isinstance(judge_guidance.get("roles"), dict):
+        role_block = judge_guidance["roles"].get(role_id)
+        if isinstance(role_block, dict):
+            questions_block = role_block.get("questions", role_block)
+            if isinstance(questions_block, dict) and question_id in questions_block:
+                return questions_block[question_id]
+
+    if isinstance(judge_guidance.get("role_question_guidance"), dict):
+        role_block = judge_guidance["role_question_guidance"].get(role_id)
+        if isinstance(role_block, dict) and question_id in role_block:
+            return role_block[question_id]
+
+    if isinstance(judge_guidance.get("guidance"), list):
+        for entry in judge_guidance["guidance"]:
+            if (
+                isinstance(entry, dict)
+                and entry.get("role_id") == role_id
+                and entry.get("question_id") == question_id
+            ):
+                return entry
+
+    role_block = judge_guidance.get(role_id)
+    if isinstance(role_block, dict) and question_id in role_block:
+        return role_block[question_id]
+
+    raise KeyError(f"Missing judge guidance for role_id={role_id!r}, question_id={question_id!r}")
+
+
+def format_guidance_values(values: Any) -> str:
+    """Format scalar or list guidance values for prompt insertion."""
+    if values is None:
+        return ""
+    if isinstance(values, list):
+        return "\n".join(f"- {value}" for value in values)
+    return f"- {values}"
+
+
+def format_role_question_guidance(
+    judge_guidance: Optional[dict],
+    role_id: str,
+    question_id: str,
+) -> str:
+    """Format optional role-question guidance using advisory wording."""
+    if not judge_guidance:
+        return ""
+
+    entry = role_question_guidance_entry(judge_guidance, role_id, question_id)
+    if isinstance(entry, str):
+        entry = {"strong_signals": [entry]}
+    if not isinstance(entry, dict):
+        raise ValueError(f"Judge guidance for {role_id}/{question_id} must be a mapping or string.")
+
+    # Guidance is phrased as examples so the role rubric remains the scoring authority.
+    sections = [
+        ("Strong signals may include...", entry.get("strong_signals", entry.get("strong"))),
+        ("Valid subtle signals may include...", entry.get("valid_subtle_signals", entry.get("subtle"))),
+        ("Weaker or generic signs may include...", entry.get("weaker_generic_signs", entry.get("weak"))),
+        (
+            "Saturation or wrong-role risks may include...",
+            entry.get("saturation_wrong_role_risks", entry.get("risks")),
+        ),
+    ]
+    lines = [
+        "Role-question advisory guidance:",
+        "The following guidance is advisory. Do not require every listed item.",
+    ]
+    for heading, values in sections:
+        formatted_values = format_guidance_values(values)
+        if formatted_values:
+            lines.append(heading)
+            lines.append(formatted_values)
+    return "\n".join(lines)
+
+
+def format_eval_prompt(
+    eval_prompt_template: str,
+    role_id: str,
+    question_index: int,
+    question: str,
+    answer: str,
+    questions_by_index: Dict[int, dict],
+    judge_guidance: Optional[dict],
+) -> str:
+    """Populate legacy and v3 eval prompt placeholders."""
+    question_metadata = questions_by_index.get(question_index, {})
+    question_id = str(question_metadata.get("id", question_index))
+    probe_family = str(question_metadata.get("probe_family", ""))
+    return eval_prompt_template.format(
+        question=question,
+        answer=answer,
+        shared_trait_rule=shared_trait_rule_from_guidance(judge_guidance),
+        role_id=role_id,
+        question_id=question_id,
+        probe_family=probe_family,
+        role_question_guidance=format_role_question_guidance(judge_guidance, role_id, question_id),
+    )
+
+
+def validate_guidance_for_responses(
+    role_id: str,
+    responses: List[dict],
+    questions_by_index: Dict[int, dict],
+    judge_guidance: Optional[dict],
+) -> None:
+    """Fail before judging if configured role-question guidance is incomplete."""
+    if not judge_guidance:
+        return
+    for response in responses:
+        question_index = response["question_index"]
+        question_metadata = questions_by_index.get(question_index, {})
+        question_id = str(question_metadata.get("id", question_index))
+        role_question_guidance_entry(judge_guidance, role_id, question_id)
+
+
 async def process_role(
     role: str,
     responses: List[dict],
@@ -71,6 +232,8 @@ async def process_role(
     max_tokens: int,
     batch_size: int,
     existing_scores: Dict[str, int],
+    questions_by_index: Dict[int, dict],
+    judge_guidance: Optional[dict],
 ) -> dict:
     """Process a single role and return scores."""
     # Build prompts for each response
@@ -96,10 +259,15 @@ async def process_role(
         if key in existing_scores:
             continue
 
-        # Fill in template
-        judge_prompt = eval_prompt_template.format(
+        # Extra metadata placeholders are empty unless optional files are supplied.
+        judge_prompt = format_eval_prompt(
+            eval_prompt_template=eval_prompt_template,
+            role_id=role,
+            question_index=question_idx,
             question=question,
-            answer=assistant_response
+            answer=assistant_response,
+            questions_by_index=questions_by_index,
+            judge_guidance=judge_guidance,
         )
         prompts.append(judge_prompt)
         keys.append(key)
@@ -140,6 +308,8 @@ async def main_async():
     parser.add_argument("--requests_per_second", type=int, default=100, help="Rate limit")
     parser.add_argument("--roles", nargs="+", help="Specific roles to process")
     parser.add_argument("--dry_run", action="store_true", help="Preview what would be processed without making API calls")
+    parser.add_argument("--questions_file", type=str, help="Optional JSONL file with question metadata")
+    parser.add_argument("--judge_guidance_file", type=str, help="Optional YAML role-question judge guidance")
     args = parser.parse_args()
 
     # Check for API key (not needed for dry run)
@@ -154,6 +324,8 @@ async def main_async():
 
     responses_dir = Path(args.responses_dir)
     roles_dir = Path(args.roles_dir)
+    questions_by_index = load_questions_by_index(args.questions_file)
+    judge_guidance = load_role_question_guidance(args.judge_guidance_file)
 
     # Get response files
     response_files = sorted(responses_dir.glob("*.jsonl"))
@@ -197,6 +369,7 @@ async def main_async():
 
             # Load responses and count prompts to be scored
             responses = load_responses(response_file)
+            validate_guidance_for_responses(role, responses, questions_by_index, judge_guidance)
             prompts_for_role = 0
             sample_prompt = None
 
@@ -215,9 +388,14 @@ async def main_async():
                             if msg["role"] == "assistant":
                                 assistant_response = msg["content"]
                                 break
-                        sample_prompt = eval_prompt_template.format(
+                        sample_prompt = format_eval_prompt(
+                            eval_prompt_template=eval_prompt_template,
+                            role_id=role,
+                            question_index=question_idx,
                             question=resp["question"],
-                            answer=assistant_response
+                            answer=assistant_response,
+                            questions_by_index=questions_by_index,
+                            judge_guidance=judge_guidance,
                         )
 
             if prompts_for_role > 0:
@@ -278,6 +456,7 @@ async def main_async():
 
         # Load responses
         responses = load_responses(response_file)
+        validate_guidance_for_responses(role, responses, questions_by_index, judge_guidance)
         if not responses:
             errors.append(f"{role}: no responses found")
             failed += 1
@@ -308,6 +487,8 @@ async def main_async():
                 max_tokens=args.max_tokens,
                 batch_size=args.batch_size,
                 existing_scores=existing_scores,
+                questions_by_index=questions_by_index,
+                judge_guidance=judge_guidance,
             )
 
             # Merge scores
