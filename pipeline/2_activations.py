@@ -50,6 +50,32 @@ def load_responses(responses_file: Path) -> List[dict]:
             responses.append(entry)
     return responses
 
+
+def require_degeneracy_filter_marker(responses_dir: Path) -> None:
+    """Fail loudly if responses_dir has response files but skipped the degeneracy filter.
+
+    The real pipeline path (scripts/assistant_axis_stage1_triton_wrapper.py)
+    always writes responses_dir/../processed/degeneracy_report.json as the
+    last step of stage 1. A responses_dir with *.jsonl files but no marker
+    was populated by some other path -- most likely pipeline/1_generate.py
+    invoked directly, bypassing the wrapper -- and would silently feed
+    unfiltered, possibly degenerate text into activation extraction and,
+    downstream, vector construction. Refuse rather than proceed quietly; see
+    docs/findings/sampling_coherence.md for why this matters.
+    """
+    if not responses_dir.exists() or not any(responses_dir.glob("*.jsonl")):
+        return
+
+    marker_path = responses_dir.parent / "processed" / "degeneracy_report.json"
+    if not marker_path.exists():
+        raise RuntimeError(
+            f"Degeneracy filter marker not found: {marker_path}. {responses_dir} has "
+            "response files but was not run through the degeneracy filter "
+            "(scripts/assistant_axis_stage1_triton_wrapper.py normally writes this "
+            "marker as the last step of stage 1). Refusing to extract activations "
+            "from unfiltered responses -- see docs/findings/sampling_coherence.md."
+        )
+
 def normalize_token_ids(tokenized):
     """
     Normalize tokenizer outputs to a plain list[int].
@@ -433,6 +459,8 @@ def main():
     parser.add_argument("--thinking", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False,
                        help="Enable thinking mode for Qwen models (default: False)")
     args = parser.parse_args()
+
+    require_degeneracy_filter_marker(Path(args.responses_dir))
 
     # Detect GPUs for multi-worker decision
     if 'CUDA_VISIBLE_DEVICES' in os.environ:

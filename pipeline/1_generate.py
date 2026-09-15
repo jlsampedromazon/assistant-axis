@@ -231,9 +231,13 @@ def main():
     parser.add_argument('--tensor_parallel_size', type=int, default=None, help='Number of GPUs (auto-detect if None)')
     parser.add_argument('--gpu_memory_utilization', type=float, default=0.95, help='GPU memory utilization')
     parser.add_argument('--question_count', type=int, default=240, help='Number of questions per role')
-    parser.add_argument('--temperature', type=float, default=0.7, help='Sampling temperature')
+    parser.add_argument('--temperature', type=float, required=True,
+                         help='Sampling temperature. Required, no default -- a silent 0.7 '
+                              'fallback would make a caller that forgot this flag produce a '
+                              'non-greedy run that looked normal.')
     parser.add_argument('--max_tokens', type=int, default=512, help='Maximum tokens to generate')
-    parser.add_argument('--top_p', type=float, default=0.9, help='Top-p sampling')
+    parser.add_argument('--top_p', type=float, required=True,
+                         help='Top-p sampling. Required, no default -- see --temperature.')
     parser.add_argument('--seed', type=int, default=None,
                          help='SamplingParams seed. Applied at every temperature; a no-op at '
                               'temperature=0 (greedy decoding ignores it). Guarantees '

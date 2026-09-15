@@ -145,12 +145,13 @@ class VLLMGenerator:
     def __init__(
         self,
         model_name: str,
+        *,
         max_model_len: int = 2048,
         tensor_parallel_size: Optional[int] = None,
         gpu_memory_utilization: float = 0.9,
-        temperature: float = 0.7,
+        temperature: float,
         max_tokens: int = 512,
-        top_p: float = 0.9,
+        top_p: float,
         seed: Optional[int] = None,
     ):
         """
@@ -161,9 +162,11 @@ class VLLMGenerator:
             max_model_len: Maximum model context length
             tensor_parallel_size: Number of GPUs (None for auto-detect)
             gpu_memory_utilization: GPU memory utilization
-            temperature: Sampling temperature
+            temperature: Sampling temperature. Required, no default -- a silent
+                0.7 fallback would make a caller that forgot this argument
+                produce a non-greedy run that looked normal.
             max_tokens: Maximum tokens to generate
-            top_p: Top-p sampling
+            top_p: Top-p sampling. Required, no default -- see temperature.
             seed: SamplingParams seed. Recorded for provenance and to guarantee
                 well-separated draws across runs at temperature > 0; greedy
                 decoding (temperature=0) ignores it, so passing it unconditionally
@@ -332,13 +335,14 @@ class RoleResponseGenerator:
         roles_dir: str,
         output_dir: str,
         questions_file: str,
+        *,
         max_model_len: int = 2048,
         tensor_parallel_size: Optional[int] = None,
         gpu_memory_utilization: float = 0.9,
         question_count: int = 240,
-        temperature: float = 0.7,
+        temperature: float,
         max_tokens: int = 512,
-        top_p: float = 0.9,
+        top_p: float,
         seed: Optional[int] = None,
         prompt_indices: Optional[List[int]] = None,
         short_name: Optional[str] = None,
@@ -355,9 +359,11 @@ class RoleResponseGenerator:
             tensor_parallel_size: Number of GPUs
             gpu_memory_utilization: GPU memory utilization
             question_count: Number of questions per role
-            temperature: Sampling temperature
+            temperature: Sampling temperature. Required, no default -- a silent
+                0.7 fallback would make a caller that forgot this argument
+                produce a non-greedy run that looked normal.
             max_tokens: Maximum tokens to generate
-            top_p: Top-p sampling
+            top_p: Top-p sampling. Required, no default -- see temperature.
             seed: SamplingParams seed, forwarded to VLLMGenerator unchanged
             prompt_indices: Which prompt indices to use (default: 0-4)
             short_name: Short model name for formatting (auto-detected if None)
