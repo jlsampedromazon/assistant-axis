@@ -9,6 +9,12 @@ using an LLM judge (e.g., GPT-4). Scores are on a 0-3 scale:
     2: Model identifies as AI/LLM but has some role attributes
     3: Model is fully playing the role
 
+Alongside --output_dir/{role}.json (the parsed int scores, unchanged format),
+this also writes --output_dir/../judge_raw/{role}.json: the same keys mapped
+to {"score": ..., "raw_completion": ...}, so the judge's raw completion text
+survives for audit/spot-check even when parse_judge_score() fails or a
+completion looks ambiguous.
+
 Usage:
     uv run scripts/3_judge.py \
         --responses_dir outputs/gemma-2-27b/responses \
@@ -240,8 +246,14 @@ async def process_role(
     existing_scores: Dict[str, int],
     questions_by_index: Dict[int, dict],
     judge_guidance: Optional[dict],
-) -> dict:
-    """Process a single role and return scores."""
+) -> tuple[dict, dict]:
+    """Process a single role and return (scores, raw_completions).
+
+    raw_completions carries the judge model's raw completion text alongside
+    the parsed score for every prompt actually sent this call, keyed the same
+    way as scores -- including prompts where parsing failed or the API call
+    returned nothing, so a mis-parse is auditable rather than silently lost.
+    """
     # Build prompts for each response
     prompts = []
     keys = []
@@ -279,7 +291,7 @@ async def process_role(
         keys.append(key)
 
     if not prompts:
-        return {}
+        return {}, {}
 
     # Call judge
     logger.info(f"Scoring {len(prompts)} new responses for {role}...")
@@ -294,13 +306,14 @@ async def process_role(
 
     # Parse scores
     scores = {}
+    raw_completions = {}
     for key, response_text in zip(keys, responses_text):
-        if response_text:
-            score = parse_judge_score(response_text)
-            if score is not None:
-                scores[key] = score
+        score = parse_judge_score(response_text) if response_text else None
+        if score is not None:
+            scores[key] = score
+        raw_completions[key] = {"score": score, "raw_completion": response_text}
 
-    return scores
+    return scores, raw_completions
 
 
 async def main_async():
@@ -433,10 +446,20 @@ async def main_async():
     failed = 0
     errors = []
 
+    # Raw completions are saved alongside scores in a sibling directory,
+    # keyed identically to scores/{role}.json, rather than folded into that
+    # file's value type -- 4_vectors.py and several analysis scripts read
+    # scores/{role}.json as a plain {key: int} mapping, so changing its
+    # schema would ripple well past this script.
+    raw_output_dir = output_dir.parent / "judge_raw"
+    if not args.dry_run:
+        raw_output_dir.mkdir(parents=True, exist_ok=True)
+
     # Process each role
     for response_file in tqdm(response_files, desc="Scoring roles"):
         role = response_file.stem
         output_file = output_dir / f"{role}.json"
+        raw_output_file = raw_output_dir / f"{role}.json"
 
         # Load existing scores
         existing_scores = {}
@@ -444,6 +467,15 @@ async def main_async():
             try:
                 with open(output_file, 'r') as f:
                     existing_scores = json.load(f)
+            except Exception:
+                pass
+
+        # Load existing raw completions
+        existing_raw_completions = {}
+        if raw_output_file.exists():
+            try:
+                with open(raw_output_file, 'r') as f:
+                    existing_raw_completions = json.load(f)
             except Exception:
                 pass
 
@@ -483,7 +515,7 @@ async def main_async():
 
         # Score responses
         try:
-            new_scores = await process_role(
+            new_scores, new_raw_completions = await process_role(
                 role=role,
                 responses=responses,
                 eval_prompt_template=eval_prompt_template,
@@ -499,10 +531,15 @@ async def main_async():
 
             # Merge scores
             all_scores = {**existing_scores, **new_scores}
+            all_raw_completions = {**existing_raw_completions, **new_raw_completions}
 
             # Save scores
             with open(output_file, 'w') as f:
                 json.dump(all_scores, f, indent=2)
+
+            # Save raw completions (same keys as scores, sibling file)
+            with open(raw_output_file, 'w') as f:
+                json.dump(all_raw_completions, f, indent=2)
 
             logger.info(f"Saved {len(all_scores)} scores for {role} ({len(new_scores)} new)")
             successful += 1
