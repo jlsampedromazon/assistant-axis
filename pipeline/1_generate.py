@@ -71,6 +71,7 @@ def process_roles_on_worker(worker_id: int, gpu_ids: List[int], role_names: List
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             top_p=args.top_p,
+            seed=args.seed,
         )
 
         # Load model
@@ -233,6 +234,11 @@ def main():
     parser.add_argument('--temperature', type=float, default=0.7, help='Sampling temperature')
     parser.add_argument('--max_tokens', type=int, default=512, help='Maximum tokens to generate')
     parser.add_argument('--top_p', type=float, default=0.9, help='Top-p sampling')
+    parser.add_argument('--seed', type=int, default=None,
+                         help='SamplingParams seed. Applied at every temperature; a no-op at '
+                              'temperature=0 (greedy decoding ignores it). Guarantees '
+                              'well-separated sampling draws across runs at temperature > 0 -- '
+                              'not a promise of exact reproducibility on rerun.')
     parser.add_argument('--roles', nargs='+', help='Specific roles to process')
 
     args = parser.parse_args()
@@ -278,6 +284,7 @@ def main():
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             top_p=args.top_p,
+            seed=args.seed,
         )
 
         generator.process_all_roles(

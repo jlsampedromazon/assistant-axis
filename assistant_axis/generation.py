@@ -151,6 +151,7 @@ class VLLMGenerator:
         temperature: float = 0.7,
         max_tokens: int = 512,
         top_p: float = 0.9,
+        seed: Optional[int] = None,
     ):
         """
         Initialize vLLM generator.
@@ -163,6 +164,13 @@ class VLLMGenerator:
             temperature: Sampling temperature
             max_tokens: Maximum tokens to generate
             top_p: Top-p sampling
+            seed: SamplingParams seed. Recorded for provenance and to guarantee
+                well-separated draws across runs at temperature > 0; greedy
+                decoding (temperature=0) ignores it, so passing it unconditionally
+                is a no-op there. Not a promise of exact cross-process
+                reproducibility on rerun -- see docs/plans/
+                h3_trait_coherence_implementation_plan.md, "Seeding at
+                temperature > 0".
         """
         self.model_name = model_name
         self.max_model_len = max_model_len
@@ -171,6 +179,7 @@ class VLLMGenerator:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.top_p = top_p
+        self.seed = seed
 
         self.llm = None
         self.sampling_params = None
@@ -196,6 +205,7 @@ class VLLMGenerator:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             top_p=self.top_p,
+            seed=self.seed,
         )
 
         logger.info("Model loaded successfully")
@@ -329,6 +339,7 @@ class RoleResponseGenerator:
         temperature: float = 0.7,
         max_tokens: int = 512,
         top_p: float = 0.9,
+        seed: Optional[int] = None,
         prompt_indices: Optional[List[int]] = None,
         short_name: Optional[str] = None,
     ):
@@ -347,6 +358,7 @@ class RoleResponseGenerator:
             temperature: Sampling temperature
             max_tokens: Maximum tokens to generate
             top_p: Top-p sampling
+            seed: SamplingParams seed, forwarded to VLLMGenerator unchanged
             prompt_indices: Which prompt indices to use (default: 0-4)
             short_name: Short model name for formatting (auto-detected if None)
         """
@@ -373,6 +385,7 @@ class RoleResponseGenerator:
             temperature=temperature,
             max_tokens=max_tokens,
             top_p=top_p,
+            seed=seed,
         )
 
         self.questions = None
