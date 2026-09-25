@@ -295,23 +295,33 @@ async def process_role(
 
     # Call judge
     logger.info(f"Scoring {len(prompts)} new responses for {role}...")
+    call_errors: List[Optional[str]] = []
     responses_text = await call_judge_batch(
         client=client,
         prompts=prompts,
         model=judge_model,
         max_tokens=max_tokens,
         rate_limiter=rate_limiter,
-        batch_size=batch_size
+        batch_size=batch_size,
+        errors_out=call_errors,
     )
 
-    # Parse scores
+    # Parse scores. A key that still has no valid score after call_judge_batch's
+    # own retries (2026-09-25, Update 9 Fix A) is recorded in raw_completions
+    # with its key and error -- never silently absent -- whether the judge call
+    # itself ultimately failed (call_error set) or a response came back but
+    # didn't parse to a valid 0-3 score (call_error is None; synthesize a
+    # parse-failure message instead). parse_judge_score itself is unchanged.
     scores = {}
     raw_completions = {}
-    for key, response_text in zip(keys, responses_text):
+    for key, response_text, call_error in zip(keys, responses_text, call_errors):
         score = parse_judge_score(response_text) if response_text else None
         if score is not None:
             scores[key] = score
-        raw_completions[key] = {"score": score, "raw_completion": response_text}
+            raw_completions[key] = {"score": score, "raw_completion": response_text}
+        else:
+            error = call_error or "judge response could not be parsed to a valid 0-3 score"
+            raw_completions[key] = {"score": None, "raw_completion": response_text, "error": error}
 
     return scores, raw_completions
 
@@ -541,8 +551,27 @@ async def main_async():
             with open(raw_output_file, 'w') as f:
                 json.dump(all_raw_completions, f, indent=2)
 
-            logger.info(f"Saved {len(all_scores)} scores for {role} ({len(new_scores)} new)")
-            successful += 1
+            # Verify completeness from the actual output -- expected keys minus
+            # scored keys -- rather than relying on process_role() not having
+            # raised (2026-09-25, Update 9 Fix A item 3). A role's judge calls
+            # can all return without an exception yet still leave individual
+            # keys unscored (call_judge_batch's own retries exhausted, or a
+            # response that never parsed to a valid score); the old code's
+            # sole success signal was "process_role didn't raise," which never
+            # saw that case -- confirmed live: a real OpenAI 5xx outage window
+            # silently dropped 5 scores across 2 runs while every role's own
+            # try/except reported success.
+            expected_keys = {f"{r['label']}_p{r['prompt_index']}_q{r['question_index']}" for r in responses}
+            missing_keys = sorted(expected_keys - set(all_scores.keys()))
+            if missing_keys:
+                failed += 1
+                preview = missing_keys[:5]
+                suffix = f" (+{len(missing_keys) - 5} more)" if len(missing_keys) > 5 else ""
+                errors.append(f"{role}: {len(missing_keys)} response(s) never got a score after retries: {preview}{suffix}")
+                logger.error(f"{role}: {len(missing_keys)} response(s) missing a score after retries: {missing_keys}")
+            else:
+                logger.info(f"Saved {len(all_scores)} scores for {role} ({len(new_scores)} new)")
+                successful += 1
 
         except Exception as e:
             errors.append(f"{role}: {e}")
@@ -562,6 +591,13 @@ async def main_async():
             logger.info(f"  - {error}")
         if len(errors) > 10:
             logger.info(f"  ... and {len(errors) - 10} more")
+
+    # Any failure -> non-zero exit, so the controller halts rather than
+    # silently continuing with incomplete scores (2026-09-25, Update 9 Fix A
+    # item 3). Previously this script always returned 0 regardless of
+    # `failed`.
+    if failed > 0:
+        sys.exit(1)
 
 
 def main():

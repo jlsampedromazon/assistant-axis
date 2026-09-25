@@ -22,10 +22,11 @@ Example:
 
 import asyncio
 import os
+import random
 import re
 import time
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 import openai
 from dotenv import load_dotenv
@@ -34,6 +35,34 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# Retry policy for transient judge-call failures (2026-09-25, Llama branch's
+# Update 9 Fix A). Added after a real OpenAI 5xx outage window (2026-09-25,
+# 15:36-15:41 ET) silently dropped 5 scores across 2 runs with zero retry --
+# call_judge_single previously caught every exception and returned None on
+# the first failure, no matter how transient. 429 (rate limit), 500/502/503/
+# 504 (server-side errors -- exactly what the outage produced), and network
+# timeouts/connection errors are retried; anything else (4xx client errors
+# like a bad request or an auth failure) is not, since retrying can never fix
+# those. At least 6 attempts total, exponential backoff from a 1s base,
+# capped at 60s, with up to 25% jitter added to each delay.
+JUDGE_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+JUDGE_MAX_RETRY_ATTEMPTS = 6
+JUDGE_BASE_RETRY_DELAY_SECONDS = 1.0
+JUDGE_MAX_RETRY_DELAY_SECONDS = 60.0
+
+
+def _is_retryable_judge_error(exc: Exception) -> bool:
+    """True for 429/500/502/503/504 (every openai.APIStatusError subclass sets
+    status_code from the real HTTP response in its own __init__, so this
+    works for RateLimitError, InternalServerError, and any other
+    APIStatusError alike) or a network-level timeout/connection error. False
+    for anything else, including a bad-request or auth error a retry could
+    never fix."""
+    status_code = getattr(exc, "status_code", None)
+    if status_code in JUDGE_RETRYABLE_STATUS_CODES:
+        return True
+    return isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError))
 
 
 class RateLimiter:
@@ -93,6 +122,58 @@ def parse_judge_score(response_text: str) -> Optional[int]:
         return None
 
 
+async def _call_judge_single_with_retry(
+    client: openai.AsyncOpenAI,
+    prompt: str,
+    model: str,
+    max_tokens: int,
+    rate_limiter: RateLimiter,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Does the real work behind call_judge_single, with retries. Returns
+    (response_text, error): error is None on success, and the last
+    exception's message on failure (whether from a non-retryable error on
+    the first attempt, or JUDGE_MAX_RETRY_ATTEMPTS genuinely exhausted).
+    Never raises.
+
+    The actual API call itself -- model, messages, max_completion_tokens,
+    temperature=1 -- is byte-for-byte unchanged from before this retry
+    wrapper was added; only the surrounding retry/backoff logic is new."""
+    last_error: Optional[str] = None
+    for attempt in range(JUDGE_MAX_RETRY_ATTEMPTS):
+        await rate_limiter.acquire()
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=max_tokens,
+                temperature=1
+            )
+
+            if response.choices and response.choices[0].message.content:
+                return response.choices[0].message.content, None
+            return None, "judge returned an empty response (no choices or content)"
+
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            retryable = _is_retryable_judge_error(e)
+            is_last_attempt = attempt == JUDGE_MAX_RETRY_ATTEMPTS - 1
+            if not retryable or is_last_attempt:
+                logger.error(
+                    f"Error calling judge model (attempt {attempt + 1}/{JUDGE_MAX_RETRY_ATTEMPTS}, "
+                    f"{'non-retryable' if not retryable else 'retries exhausted'}): {e}"
+                )
+                break
+            delay = min(JUDGE_BASE_RETRY_DELAY_SECONDS * (2 ** attempt), JUDGE_MAX_RETRY_DELAY_SECONDS)
+            delay += random.uniform(0, delay * 0.25)
+            logger.warning(
+                f"Retryable error calling judge model (attempt {attempt + 1}/{JUDGE_MAX_RETRY_ATTEMPTS}), "
+                f"retrying in {delay:.1f}s: {e}"
+            )
+            await asyncio.sleep(delay)
+
+    return None, last_error
+
+
 async def call_judge_single(
     client: openai.AsyncOpenAI,
     prompt: str,
@@ -100,24 +181,14 @@ async def call_judge_single(
     max_tokens: int,
     rate_limiter: RateLimiter
 ) -> Optional[str]:
-    """Call the judge model with a single prompt."""
-    await rate_limiter.acquire()
-
-    try:
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=max_tokens,
-            temperature=1
-        )
-
-        if response.choices and response.choices[0].message.content:
-            return response.choices[0].message.content
-        return None
-
-    except Exception as e:
-        logger.error(f"Error calling judge model: {e}")
-        return None
+    """Call the judge model with a single prompt. Retries transient errors
+    (see _call_judge_single_with_retry / JUDGE_RETRYABLE_STATUS_CODES);
+    returns None only once retries are exhausted or a non-retryable error
+    occurs. Same signature and return contract as before this function
+    gained retries (2026-09-25, Llama branch's Update 9 Fix A) -- every
+    existing caller is unaffected except for gaining retry robustness."""
+    text, _error = await _call_judge_single_with_retry(client, prompt, model, max_tokens, rate_limiter)
+    return text
 
 
 async def call_judge_batch(
@@ -126,30 +197,51 @@ async def call_judge_batch(
     model: str,
     max_tokens: int,
     rate_limiter: RateLimiter,
-    batch_size: int = 50
+    batch_size: int = 50,
+    errors_out: Optional[List[Optional[str]]] = None,
 ) -> List[Optional[str]]:
-    """Call the judge model with multiple prompts concurrently."""
+    """Call the judge model with multiple prompts concurrently. Return type
+    and every existing caller's contract are unchanged (2026-09-25, Llama
+    branch's Update 9 Fix A) -- individual calls now retry transient errors
+    internally (see _call_judge_single_with_retry), so callers who never
+    asked for error detail simply see fewer Nones.
+
+    errors_out (optional, default None): if given, must be a list the
+    caller owns (typically `[]`) -- this function extends it with one entry
+    per prompt, in the same order as the returned results: None for a
+    prompt that succeeded, the last error message for one that didn't (after
+    retries, or immediately for a non-retryable error). Lets a caller that
+    needs to know WHY a specific prompt failed (3_judge.py, to record a
+    FAILED key with its error) get that without this function's return type
+    changing for anyone else."""
     results = []
 
     for i in range(0, len(prompts), batch_size):
         batch = prompts[i:i + batch_size]
 
         tasks = [
-            call_judge_single(client, prompt, model, max_tokens, rate_limiter)
+            _call_judge_single_with_retry(client, prompt, model, max_tokens, rate_limiter)
             for prompt in batch
         ]
 
         batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        processed = []
+        processed: List[Tuple[Optional[str], Optional[str]]] = []
         for result in batch_results:
             if isinstance(result, Exception):
+                # _call_judge_single_with_retry itself never raises (it always
+                # returns a (text, error) tuple), so reaching this branch means
+                # something outside the retry loop itself went wrong (e.g. a
+                # cancelled task) -- kept as defensive handling, matching the
+                # pre-retry code's own defensive branch here.
                 logger.error(f"Exception in batch: {result}")
-                processed.append(None)
+                processed.append((None, str(result)))
             else:
                 processed.append(result)
 
-        results.extend(processed)
+        results.extend(text for text, _error in processed)
+        if errors_out is not None:
+            errors_out.extend(error for _text, error in processed)
 
     return results
 
