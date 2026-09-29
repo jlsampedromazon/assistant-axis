@@ -16,7 +16,7 @@ Example (vLLM - batch inference):
 import json
 import logging
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 
 import torch
 from tqdm import tqdm
@@ -133,6 +133,44 @@ def format_conversation(
 # vLLM Generation (for batch inference / pipeline)
 # =============================================================================
 
+
+def vllm_chat_template_kwargs(model_name: str) -> Dict[str, Any]:
+    """Extra apply_chat_template kwargs the vLLM generation path needs, keyed only off the
+    model name -- no engine/weights required. Split out from VLLMGenerator.generate_batch so it
+    can be reused by build_vllm_prompt_token_ids's callers (including tests) without loading a
+    model."""
+    chat_template_kwargs: Dict[str, Any] = {}
+    if "qwen" in model_name.lower():
+        # Disable thinking for Qwen models (https://github.com/vllm-project/vllm/issues/18066)
+        chat_template_kwargs["enable_thinking"] = False
+    return chat_template_kwargs
+
+
+def build_vllm_prompt_token_ids(
+    tokenizer, conversation: List[Dict[str, str]], chat_template_kwargs: Dict[str, Any]
+) -> List[int]:
+    """The exact tokenization the vLLM generation path uses: apply_chat_template with
+    tokenize=True (not tokenize=False followed by a second, implicit tokenization inside
+    vLLM's own text-prompt handling -- see generate_batch's own comment for why that doubled
+    the leading start token for BOS-token models). Pure tokenizer call, no model weights or
+    vLLM engine needed -- callable with any AutoTokenizer, including from tests.
+
+    Returns a plain list of ints -- required by vLLM's own TokensPrompt(prompt_token_ids=...),
+    which does not accept a BatchEncoding. The pinned environment's transformers version
+    (5.17.0) returns a BatchEncoding (dict-like, with an 'input_ids' key) from
+    apply_chat_template(tokenize=True) rather than a bare list; normalizing here keeps this
+    function's own documented return type true regardless of that transformers-version detail.
+    """
+    ids = tokenizer.apply_chat_template(
+        conversation, tokenize=True, add_generation_prompt=True, **chat_template_kwargs
+    )
+    if hasattr(ids, "input_ids"):
+        return list(ids.input_ids)
+    if isinstance(ids, dict):
+        return list(ids["input_ids"])
+    return list(ids)
+
+
 class VLLMGenerator:
     """
     Generator for batch inference using vLLM.
@@ -229,19 +267,27 @@ class VLLMGenerator:
         self.load()
 
         tokenizer = self.llm.get_tokenizer()
+        chat_template_kwargs = vllm_chat_template_kwargs(self.model_name)
 
-        # Disable thinking for Qwen models (https://github.com/vllm-project/vllm/issues/18066)
-        chat_template_kwargs = {}
-        if "qwen" in self.model_name.lower():
-            chat_template_kwargs["enable_thinking"] = False
+        # Tokenize directly (tokenize=True) rather than rendering to a string and
+        # letting vLLM's LLM.generate() re-tokenize it: apply_chat_template's own
+        # template text already starts with the model's start token (e.g. Llama's
+        # <|begin_of_text|>), and vLLM's text-prompt path tokenizes with
+        # add_special_tokens=True by default, so passing a string prompt doubles
+        # that leading token. Passing pre-tokenized ids via TokensPrompt makes this
+        # generation path produce the exact same token sequence activation capture
+        # sees (assistant_axis/internals/conversation.py's own
+        # apply_chat_template(..., tokenize=True) call), instead of stripping a
+        # doubled token after the fact. No-op for models with no BOS token (e.g.
+        # Qwen): tokenize=True vs tokenize=False+re-tokenize already produced
+        # identical ids for those, so this only removes a duplicate that existed
+        # for BOS-token models.
+        from vllm import TokensPrompt
 
         prompts = []
         for conv in conversations:
-            prompt = tokenizer.apply_chat_template(
-                conv, tokenize=False, add_generation_prompt=True,
-                **chat_template_kwargs
-            )
-            prompts.append(prompt)
+            token_ids = build_vllm_prompt_token_ids(tokenizer, conv, chat_template_kwargs)
+            prompts.append(TokensPrompt(prompt_token_ids=token_ids))
 
         logger.info(f"Running batch inference for {len(prompts)} prompts...")
         outputs = self.llm.generate(prompts, self.sampling_params)
